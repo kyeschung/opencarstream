@@ -1445,7 +1445,7 @@ def run_pipeline(stream: Stream):
                     "bestvideo/best",
                 ]
             return [
-                "bestvideo[ext=mp4]/best[ext=mp4]",
+                "bestvideo[vcodec^=avc1][height<=720][fps<=30]/bestvideo[vcodec^=avc1][height<=720]/best[vcodec^=avc1][height<=720]/bestvideo[ext=mp4][height<=720]",
                 "bestvideo/best",
             ]
 
@@ -4984,8 +4984,8 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run_pipeline,
                              args=(stream,), daemon=True).start()
 
-        # Wait up to 20s for first frame
-        deadline = time.time() + 20
+        # Wait up to 60s for first frame (yt-dlp alone can take 15-20s on a Pi)
+        deadline = time.time() + 60
         with stream.frame_cond:
             while stream.frame is None and stream.status not in ("error", "done"):
                 if time.time() > deadline:

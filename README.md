@@ -202,6 +202,7 @@ sudo cp /etc/letsencrypt/live/stream.yourdomain.com/privkey.pem   certs/key.pem
 | `LOCAL_MEDIA_DIR`     | /media/videos         | Local Media folder path inside container |
 | `IPTV_LISTS_DIR`      | /iptv_lists           | IPTV list folder (`.m3u`/`.m3u8`) inside container |
 | `SUBSCRIPTIONS_FILE`  | /subscriptions.json   | Path to subscriptions JSON inside container |
+| `RESOLVE_CACHE_SECS`  | 600                   | Cache yt-dlp URL lookups so retries and reloads start faster (0 = off) |
 
 Override in `docker-compose.yml` under `environment:`.
 
@@ -319,7 +320,16 @@ Stream tab.
 | `GET /iptv_streams?list=NAME`   | JSON stream entries parsed from a playlist       |
 | `GET /subscriptions`            | JSON channel list from subscriptions.json        |
 | `GET /health`                   | `{"ok":true}` — for uptime monitors              |
-| `GET /status`                   | JSON list of active streams                      |
+| `GET /status`                   | JSON list of active streams (includes start-up `stage`: `queued`, `resolving`, `starting`, `live`, `error`, `done`) |
+| `GET /stream_status?sid=ID`     | Same fields for one stream (polled by the watch page's loading screen) |
+
+### Tests
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+The stream reuse/stop tests use a fake `yt-dlp` and need no network; the end-to-end case also needs `ffmpeg`.
 
 ---
 

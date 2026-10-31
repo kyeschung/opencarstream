@@ -10,9 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp as a standalone binary (always latest)
+# Install yt-dlp from the zipapp release (always latest). The zipapp runs on
+# the image's python3, so it works on armhf (Raspberry Pi) where the
+# yt-dlp_linux PyInstaller binary is not available.
 RUN curl -fsSL \
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux" \
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp" \
     -o /usr/local/bin/yt-dlp \
     && chmod +x /usr/local/bin/yt-dlp
 

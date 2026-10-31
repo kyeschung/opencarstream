@@ -95,6 +95,11 @@ LOCAL_MEDIA_EXTS    = {
     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpg", ".mpeg", ".ts",
 }
 IPTV_LIST_EXTS      = {".m3u", ".m3u8"}
+# Cache yt-dlp URL resolutions (direct CDN URL + title + fps) for this many
+# seconds so a retry, reload or re-tap skips the slow yt-dlp step. YouTube
+# CDN URLs stay valid for hours; keep this short so stale URLs are rare.
+RESOLVE_CACHE_SECS  = int(os.environ.get("RESOLVE_CACHE_SECS", "600"))
+CLIENT_COOKIE       = "ocs_client"
 
 
 # ── Per-stream state ──────────────────────────────────────────────────────────
@@ -127,15 +132,69 @@ class Stream:
         self._frame_history = deque(maxlen=max(MJPEG_FPS * 12, 120))
         self.frame_cond     = threading.Condition(self.lock)  # notified whenever a new frame arrives
         self.audio_only     = False  # when True, skip MJPEG pipeline and run audio only
+        # Playback-UX bookkeeping
+        self.key        = ""          # identity used for reuse (mode + url + quality + seek)
+        self.owner      = ""          # client id (cookie) that started this stream
+        self.thumb      = ""
+        self._stage     = "queued"    # queued | resolving | starting (see stage property)
+        self._stopped   = threading.Event()
+        self._pipeline_started = False
+        self.retryable  = True        # False when a retry cannot help (e.g. private video)
+
+    @property
+    def stage(self) -> str:
+        """Coarse start-up progress for the loading overlay.
+
+        queued    - created, pipeline not running yet
+        resolving - yt-dlp is resolving the media URL ("Fetching video...")
+        starting  - ffmpeg launched, waiting for the first frame
+        live      - at least one frame has been produced
+        error / done
+        """
+        if self.status == "error":
+            return "error"
+        if self.status == "done" or self._stopped.is_set():
+            return "done"
+        if self.first_frame_at is not None:
+            return "live"
+        return self._stage
+
+    def set_stage(self, stage: str):
+        with self.lock:
+            self._stage = stage
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
+    def ensure_pipeline(self) -> bool:
+        """Start run_pipeline exactly once. Returns True if this call started it."""
+        with self.lock:
+            if self._pipeline_started or self._stopped.is_set():
+                return False
+            if self.status != "starting":
+                return False
+            self._pipeline_started = True
+        threading.Thread(target=run_pipeline, args=(self,), daemon=True).start()
+        return True
+
+    def attach_proc(self, attr: str, proc) -> bool:
+        """Register a child process; kill it right away if the stream was stopped.
+        Returns False when the stream is stopped (caller should bail out)."""
+        with self.lock:
+            setattr(self, attr, proc)
+            stopped = self._stopped.is_set()
+        if stopped:
+            _kill_proc(proc)
+            return False
+        return True
 
     def stop(self):
-        for proc in [self._ff_proc, self._yt_proc, self._audio_proc]:
-            if proc:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=3)
-                except Exception:
-                    pass
+        self._stopped.set()
+        with self.lock:
+            procs = [self._ff_proc, self._yt_proc, self._audio_proc]
+        for proc in procs:
+            _kill_proc(proc)
         self._ff_proc     = None
         self._yt_proc     = None
         self._audio_proc  = None
@@ -148,12 +207,17 @@ class Stream:
             self._frame_history.clear()
 
     def to_dict(self):
+        now = time.time()
         return {
             "id":     self.id,
             "url":    self.url,
             "quality": self.quality,
             "started_at": self.started_at,
             "status": self.status,
+            "stage":  self.stage,
+            "thumb":  self.thumb,
+            "wait_s": round((self.first_frame_at or now) - self.created_at, 1),
+            "retryable": self.retryable,
             "title":  self.title,
             "error":  self.error,
             "error_detail": self.error_detail,
@@ -161,6 +225,150 @@ class Stream:
             "fps":    self.fps,
             "seek_s": self.seek_s,
         }
+
+
+def _kill_proc(proc) -> None:
+    """Terminate a child process, escalating to SIGKILL if it hangs."""
+    if not proc:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+class ResolveCache:
+    """Tiny TTL cache for yt-dlp resolutions keyed by (url, format)."""
+
+    def __init__(self, ttl_s: int, max_items: int = 64):
+        self.ttl_s = ttl_s
+        self.max_items = max_items
+        self._lock = threading.Lock()
+        self._items: dict[tuple, tuple[float, dict]] = {}
+
+    def get(self, key: tuple) -> dict | None:
+        if self.ttl_s <= 0:
+            return None
+        with self._lock:
+            hit = self._items.get(key)
+            if not hit:
+                return None
+            expires, value = hit
+            if time.time() > expires:
+                del self._items[key]
+                return None
+            return dict(value)
+
+    def put(self, key: tuple, value: dict) -> None:
+        if self.ttl_s <= 0:
+            return
+        with self._lock:
+            if len(self._items) >= self.max_items:
+                oldest = min(self._items, key=lambda k: self._items[k][0])
+                del self._items[oldest]
+            self._items[key] = (time.time() + self.ttl_s, dict(value))
+
+    def invalidate(self, url: str) -> None:
+        with self._lock:
+            for k in [k for k in self._items if k[0] == url]:
+                del self._items[k]
+
+
+resolve_cache = ResolveCache(RESOLVE_CACHE_SECS)
+_audio_inflight: dict[tuple, threading.Event] = {}
+_audio_inflight_lock = threading.Lock()
+
+# yt-dlp errors where trying another format (or piping) cannot help.
+_FATAL_YTDLP_PATTERNS = (
+    "video unavailable", "private video", "has been removed",
+    "is not available", "members-only", "members only",
+    "sign in to confirm your age", "unsupported url", "is not a valid url",
+    "http error 404", "account associated with this video has been terminated",
+)
+
+
+def _is_fatal_ytdlp_error(err: str) -> bool:
+    low = (err or "").lower()
+    if "requested format is not available" in low:
+        return False
+    return any(p in low for p in _FATAL_YTDLP_PATTERNS)
+
+
+def _youtube_thumb(url: str) -> str:
+    """Deterministic YouTube thumbnail for the loading overlay (no network)."""
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/live/|/embed/)([A-Za-z0-9_-]{11})", url or "")
+    return f"https://i.ytimg.com/vi/{m.group(1)}/hqdefault.jpg" if m else ""
+
+
+def _parse_resolve_output(stdout: str) -> dict | None:
+    """Parse `yt-dlp --print "%(fps)s\t%(title)s" --print urls` output."""
+    lines = [ln for ln in (stdout or "").splitlines() if ln.strip()]
+    urls = [ln.strip() for ln in lines if re.match(r"^https?://", ln.strip())]
+    if not urls:
+        return None
+    first = lines[0]
+    fps: float | None = None
+    title = ""
+    if not re.match(r"^https?://", first.strip()):
+        fps_raw, _, title = first.partition("\t")
+        try:
+            fps = float(fps_raw)
+            if fps <= 0:
+                fps = None
+        except ValueError:
+            fps = None
+        title = title.strip()
+        if title == "NA":
+            title = ""
+    return {"url": urls[0], "title": title, "fps": fps}
+
+
+def _ytdlp_resolve(stream: "Stream", fmt: str, timeout_s: int = 45) -> tuple[dict | None, str]:
+    """Resolve a direct media URL (plus title and fps) with a single yt-dlp
+    call, using the short-lived cache when possible. The yt-dlp process is
+    registered on the stream so stopping the stream kills it."""
+    cache_key = (stream.url, fmt)
+    cached = resolve_cache.get(cache_key)
+    if cached:
+        log.info(f"[{stream.id}] Resolve cache hit for fmt={fmt}")
+        return cached, ""
+    cmd = [
+        "yt-dlp", "--js-runtimes", "node", "--no-playlist",
+        "-f", fmt,
+        "--print", "%(fps)s\t%(title)s",
+        "--print", "urls",
+        "--no-warnings",
+        stream.url,
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except Exception as e:
+        return None, str(e)
+    if not stream.attach_proc("_yt_proc", proc):
+        return None, "stopped"
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_proc(proc)
+        out, err = "", f"yt-dlp timed out after {timeout_s}s"
+    finally:
+        with stream.lock:
+            if stream._yt_proc is proc:
+                stream._yt_proc = None
+    if stream.stopped:
+        return None, "stopped"
+    info = _parse_resolve_output(out) if proc.returncode == 0 else None
+    if info:
+        resolve_cache.put(cache_key, info)
+        return info, ""
+    return None, (err or "").strip()[-400:]
 
 
 # ── Stream registry ───────────────────────────────────────────────────────────
@@ -197,12 +405,86 @@ class Registry:
                 oldest = min(self._streams.values(), key=lambda s: s.last_used)
                 log.info(f"Evicting stream {oldest.id} ({oldest.url[:60]})")
                 oldest.stop()
+                oldest.status = "done"
                 del self._streams[oldest.id]
 
             sid    = self._make_id()
             stream = Stream(sid, url, quality=quality)
+            stream.key = url
             self._streams[sid] = stream
             return stream
+
+    @staticmethod
+    def _reusable(s: Stream, key: str, owner: str) -> bool:
+        # Only reuse a stream that has not produced its first frame yet. Once
+        # a VOD stream is live, a fresh /audio connection would restart audio
+        # from the seek point while video keeps going, so a re-tap restarts.
+        return (
+            s.key == key
+            and s.owner == owner
+            and s.status in ("starting", "streaming")
+            and not s.stopped
+            and s.first_frame_at is None
+        )
+
+    def find_reusable(self, key: str, owner: str) -> Stream | None:
+        with self._lock:
+            for s in self._streams.values():
+                if self._reusable(s, key, owner):
+                    s.last_used = time.time()
+                    return s
+        return None
+
+    def acquire(
+        self,
+        key: str,
+        url: str,
+        quality: int | None = None,
+        owner: str = "",
+        reuse: bool = True,
+    ) -> tuple[Stream, bool]:
+        """Get the stream a client should watch.
+
+        - Same client + same key still starting up: return that stream (a
+          double tap or reload while yt-dlp is still working must not spawn
+          a second pipeline).
+        - Anything else: stop every other stream owned by this client (kill
+          yt-dlp/ffmpeg) and create a fresh one.
+        Returns (stream, reused).
+        """
+        to_stop: list[Stream] = []
+        with self._lock:
+            if reuse:
+                for s in self._streams.values():
+                    if self._reusable(s, key, owner):
+                        s.last_used = time.time()
+                        return s, True
+
+            for sid, s in list(self._streams.items()):
+                if s.owner == owner:
+                    to_stop.append(s)
+                    del self._streams[sid]
+
+            while len(self._streams) >= MAX_STREAMS:
+                oldest = min(self._streams.values(), key=lambda s: s.last_used)
+                log.info(f"Evicting stream {oldest.id} ({oldest.url[:60]})")
+                to_stop.append(oldest)
+                del self._streams[oldest.id]
+
+            sid    = self._make_id()
+            stream = Stream(sid, url, quality=quality)
+            stream.key = key
+            stream.owner = owner
+            self._streams[sid] = stream
+
+        # Kill old pipelines outside the registry lock (terminate can block).
+        for s in to_stop:
+            log.info(f"Stopping stream {s.id} (client switched to {stream.id})")
+            s.stop()
+            with s.lock:
+                if s.status != "error":
+                    s.status = "done"
+        return stream, False
 
     def get(self, sid: str) -> Stream | None:
         with self._lock:
@@ -514,19 +796,43 @@ def _yt_lang_args() -> list[str]:
     ]
 
 
-def fetch_title(stream: Stream):
-    if _is_direct_stream(stream.url):
-        return  # no yt-dlp for direct streams; title stays empty
+def _ytdlp_audio_url(url: str, audio_fmt: str) -> str:
+    """Resolve the direct audio URL via yt-dlp, cached like the video URL so
+    a reload or retry does not pay for another yt-dlp start-up."""
+    cache_key = (url, "audio:" + audio_fmt)
+    cached = resolve_cache.get(cache_key)
+    if cached:
+        return cached["url"]
+    # A reload mid-start opens a new /audio while the first lookup is still
+    # running; wait for it instead of starting a second yt-dlp on the Pi.
+    with _audio_inflight_lock:
+        pending = _audio_inflight.get(cache_key)
+        owner = pending is None
+        if owner:
+            pending = threading.Event()
+            _audio_inflight[cache_key] = pending
+    if not owner:
+        pending.wait(timeout=35)
+        cached = resolve_cache.get(cache_key)
+        return cached["url"] if cached else ""
+    direct_url = ""
     try:
         r = subprocess.run(
-            ["yt-dlp", "--js-runtimes", "node", "--no-playlist", "--print", "title", stream.url],
-            capture_output=True, text=True, timeout=15
+            ["yt-dlp", "--js-runtimes", "node", "--no-playlist",
+             "-f", audio_fmt, "--get-url", "--quiet", url],
+            capture_output=True, text=True, timeout=30,
         )
-        if r.returncode == 0:
-            with stream.lock:
-                stream.title = r.stdout.strip()
+        lines = r.stdout.strip().splitlines() if r.returncode == 0 else []
+        direct_url = lines[0].strip() if lines else ""
+        if direct_url:
+            resolve_cache.put(cache_key, {"url": direct_url})
     except Exception:
-        pass
+        direct_url = ""
+    finally:
+        with _audio_inflight_lock:
+            _audio_inflight.pop(cache_key, None)
+        pending.set()
+    return direct_url
 
 
 def _fetch_duration_s(url: str) -> int:
@@ -1146,12 +1452,7 @@ def _start_audio_buffer_any(stream: Stream):
     audio_fmt = "bestaudio[ext=m4a]/bestaudio"
     seek_args: list[str] = ["-ss", str(int(stream.seek_s))] if stream.seek_s > 0 else []
     try:
-        url_r = subprocess.run(
-            ["yt-dlp", "--js-runtimes", "node", "--no-playlist",
-             "-f", audio_fmt, "--get-url", "--quiet", stream.url],
-            capture_output=True, text=True, timeout=30,
-        )
-        direct_url = url_r.stdout.strip().splitlines()[0] if url_r.returncode == 0 else ""
+        direct_url = _ytdlp_audio_url(stream.url, audio_fmt)
     except Exception:
         direct_url = ""
 
@@ -1365,8 +1666,9 @@ def _run_hls_pipeline(stream: Stream):
             ff_proc = subprocess.Popen(
                 ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
+        if not stream.attach_proc("_ff_proc", ff_proc):
+            return
         with stream.lock:
-            stream._ff_proc = ff_proc
             stream.status = "streaming"
             if stream.started_at is None:
                 stream.started_at = time.time()
@@ -1398,6 +1700,8 @@ def _run_hls_pipeline(stream: Stream):
 
         ff_rc = ff_proc.poll()
         produced = stream.frame is not None
+        if stream.stopped:
+            return
         with stream.lock:
             if produced:
                 stream.status = "done"
@@ -1418,9 +1722,13 @@ def _run_hls_pipeline(stream: Stream):
 
 def run_pipeline(stream: Stream):
     log.info(f"[{stream.id}] Starting pipeline for: {stream.url}")
-    threading.Thread(target=fetch_title, args=(stream,), daemon=True).start()
+    with stream.lock:
+        stream._pipeline_started = True
+    if stream.stopped:
+        return
 
     if _is_direct_stream(stream.url):
+        stream.set_stage("starting")
         _run_hls_pipeline(stream)
         return
 
@@ -1476,21 +1784,41 @@ def run_pipeline(stream: Stream):
 
         for attempt_idx, fmt in enumerate(_format_candidates(stream.quality), start=1):
             yt_proc = None
+            if stream.stopped:
+                return
 
             # Always resolve a direct CDN URL first. This lets ffmpeg download
             # at real-time speed (-re) instead of letting yt-dlp race ahead and
             # buffer gigabytes into a pipe — which breaks long videos.
-            url_r = subprocess.run(
-                ["yt-dlp", "--js-runtimes", "node", "--no-playlist",
-                 "-f", fmt, "--get-url", "--quiet", stream.url],
-                capture_output=True, text=True, timeout=30,
-            )
-            direct_url = url_r.stdout.strip().splitlines()[0] if url_r.returncode == 0 else ""
+            # One yt-dlp call also yields title + fps, so no separate title
+            # lookup or ffprobe is needed (each costs seconds on a Pi).
+            stream.set_stage("resolving")
+            info, resolve_err = _ytdlp_resolve(stream, fmt)
+            if stream.stopped:
+                return
+            if not info and _is_fatal_ytdlp_error(resolve_err):
+                err_line = next(
+                    (ln for ln in reversed(resolve_err.splitlines()) if "ERROR" in ln),
+                    resolve_err.splitlines()[-1] if resolve_err else "",
+                )
+                with stream.lock:
+                    stream.status = "error"
+                    stream.retryable = False
+                    stream.error = err_line.replace("ERROR:", "").strip()[:300]
+                    stream.error_detail = resolve_err[-1800:]
+                log.error(f"[{stream.id}] yt-dlp cannot play this URL: {stream.error}")
+                return
+            direct_url = info["url"] if info else ""
+            if info and info.get("title"):
+                with stream.lock:
+                    if not stream.title:
+                        stream.title = info["title"]
+            stream.set_stage("starting")
 
             if direct_url:
                 # Detect source FPS so we output at the native rate — no frame
                 # duplication/dropping, which is the main cause of A/V drift.
-                source_fps = _probe_fps(direct_url)
+                source_fps = info.get("fps") or _probe_fps(direct_url)
                 output_fps = min(source_fps, MJPEG_FPS) if source_fps else MJPEG_FPS
                 stream.fps = output_fps
                 log.info(f"[{stream.id}] source_fps={source_fps} → output_fps={output_fps}")
@@ -1522,7 +1850,7 @@ def run_pipeline(stream: Stream):
                 # Fallback: pipe yt-dlp → ffmpeg (no seek support, may buffer on long videos)
                 if stream.seek_s > 0:
                     attempt_errors.append(
-                        f"attempt={attempt_idx} fmt={fmt} yt-dlp --get-url failed (seek requires direct URL): {url_r.stderr.strip()}"
+                        f"attempt={attempt_idx} fmt={fmt} yt-dlp --get-url failed (seek requires direct URL): {resolve_err}"
                     )
                     continue
                 log.warning(f"[{stream.id}] --get-url failed for fmt={fmt}, falling back to pipe")
@@ -1562,9 +1890,15 @@ def run_pipeline(stream: Stream):
             with stream.lock:
                 stream._yt_proc = yt_proc
                 stream._ff_proc = ff_proc
-                stream.status = "streaming"
-                if stream.started_at is None:
-                    stream.started_at = time.time()
+                stopped_meanwhile = stream._stopped.is_set()
+                if not stopped_meanwhile:
+                    stream.status = "streaming"
+                    if stream.started_at is None:
+                        stream.started_at = time.time()
+            if stopped_meanwhile:
+                _kill_proc(ff_proc)
+                _kill_proc(yt_proc)
+                return
 
             if yt_proc is not None:
                 yt_err_t = threading.Thread(
@@ -1618,6 +1952,9 @@ def run_pipeline(stream: Stream):
             ff_err_t.join(timeout=0.2)
 
             produced_frames = stream.frame is not None and stream.frame is not frame_before
+            if stream.stopped:
+                log.info(f"[{stream.id}] Pipeline stopped")
+                return
             if produced_frames:
                 with stream.lock:
                     stream.status = "done"
@@ -1639,6 +1976,8 @@ def run_pipeline(stream: Stream):
                 stream.status = "error"
                 stream.error = "No video frames were produced"
                 stream.error_detail = " || ".join(attempt_errors)[-1800:]
+            # A cached CDN URL may have gone stale; make the retry resolve fresh.
+            resolve_cache.invalidate(stream.url)
             log.error(f"[{stream.id}] Pipeline failed: {stream.error_detail}")
 
     except Exception as e:
@@ -1646,6 +1985,7 @@ def run_pipeline(stream: Stream):
             stream.status = "error"
             stream.error  = str(e)
             stream.error_detail = ""
+        resolve_cache.invalidate(stream.url)
         log.error(f"[{stream.id}] Pipeline error: {e}")
     finally:
         stream.stop()
@@ -3324,6 +3664,72 @@ STATUS_HTML = """<!DOCTYPE html>
   } catch(e) { /* init error — non-fatal */ }
 })();
 </script>
+<style>
+  .open-ov{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.92);color:#fff;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  .open-ov.show{display:flex;}
+  .open-ov-art{width:min(480px,70vw);aspect-ratio:16/9;border-radius:16px;background:#15151b center/cover no-repeat;position:relative;overflow:hidden;}
+  .open-ov-art::after{content:"";position:absolute;inset:0;background:rgba(0,0,0,.45);}
+  .open-ov-spin{position:absolute;z-index:1;left:50%;top:50%;width:104px;height:104px;margin:-52px 0 0 -52px;border-radius:50%;border:10px solid rgba(255,255,255,.22);border-top-color:#fff;animation:openspin .9s linear infinite;}
+  @keyframes openspin{to{transform:rotate(360deg);}}
+  .open-ov-title{margin-top:26px;font-size:1.9rem;font-weight:700;max-width:860px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;}
+  .open-ov-text{margin-top:14px;font-size:1.5rem;color:#e6e6ee;}
+</style>
+<div id="open-ov" class="open-ov" aria-live="polite">
+  <div id="open-ov-art" class="open-ov-art"><div class="open-ov-spin"></div></div>
+  <div id="open-ov-title" class="open-ov-title"></div>
+  <div class="open-ov-text">Opening...</div>
+</div>
+<script>
+(function () {
+  // Instant feedback on tap: cover the page while the watch page loads so a
+  // second tap cannot start another stream, and hand the card's title and
+  // thumbnail to the watch page for its loading screen.
+  var ov = document.getElementById("open-ov");
+  var art = document.getElementById("open-ov-art");
+  var titleEl = document.getElementById("open-ov-title");
+  var hideTimer = null;
+
+  document.addEventListener("click", function (e) {
+    if (ov.classList.contains("show")) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    var card = e.target && e.target.closest ? e.target.closest(".feed-card") : null;
+    if (!card || (e.target.closest && e.target.closest("button"))) return;
+    var t = card.querySelector(".feed-title");
+    var im = card.querySelector("img.feed-thumb");
+    var hint = {
+      title: t ? t.textContent : "",
+      thumb: im && im.getAttribute("src") ? im.src : "",
+      t: Date.now()
+    };
+    try { sessionStorage.setItem("ocs_pending", JSON.stringify(hint)); } catch (err) {}
+  }, true);
+
+  window.addEventListener("beforeunload", function () {
+    var hint = null;
+    try { hint = JSON.parse(sessionStorage.getItem("ocs_pending") || "null"); } catch (e) {}
+    if (hint && Date.now() - (hint.t || 0) < 3000) {
+      titleEl.textContent = hint.title || "";
+      if (hint.thumb) art.style.backgroundImage = "url('" + String(hint.thumb).replace(/'/g, "%27") + "')";
+    } else {
+      titleEl.textContent = "";
+      art.style.backgroundImage = "";
+    }
+    ov.classList.add("show");
+    // Safety net if the navigation is cancelled or never completes.
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () { ov.classList.remove("show"); }, 20000);
+  });
+
+  // Coming back via the browser Back button restores this page from cache.
+  window.addEventListener("pageshow", function () {
+    clearTimeout(hideTimer);
+    ov.classList.remove("show");
+  });
+})();
+</script>
 </body></html>"""
 
 WATCH_HTML = """<!DOCTYPE html>
@@ -3334,17 +3740,16 @@ WATCH_HTML = """<!DOCTYPE html>
 <title>OpenCarStream Watch</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@300;500&display=swap');
-  :root{--red:#e31937;--dark:#090909;--panel:#111117;--border:#252530;--text:#e0e0ee;}
-  @media(prefers-color-scheme:light){:root{--dark:#f4f4f6;--panel:#ffffff;--border:#d8d8e0;--text:#1a1a2e;}}
+  :root{--red:#e31937;--dark:#090909;--panel:#111117;--border:#252530;--text:#e0e0ee;--muted:#8a8a9a;}
+  @media(prefers-color-scheme:light){:root{--dark:#f4f4f6;--panel:#ffffff;--border:#d8d8e0;--text:#1a1a2e;--muted:#666677;}}
   *{margin:0;padding:0;box-sizing:border-box;}
   body{background:var(--dark);color:var(--text);font-family:'Rajdhani',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:16px;}
   .top{width:100%;max-width:1280px;display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:12px;flex-wrap:wrap;}
   .title{font-family:'Orbitron',monospace;letter-spacing:.1em;color:var(--red);font-size:1rem;}
   .back{color:var(--red);text-decoration:none;font-family:monospace;}
   .wrap{width:100%;max-width:1280px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px;}
-  img{width:100%;height:auto;display:block;background:black;border-radius:8px;}
+  img#mjpeg{width:100%;height:auto;display:block;background:black;border-radius:8px;aspect-ratio:16/9;}
   audio{width:100%;margin-top:10px;}
-  .diag{margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-family:monospace;font-size:.85rem;line-height:1.4;white-space:pre-wrap;color:#f0b5bf;background:#160d11;display:none;}
   .seek-bar{display:flex;align-items:center;gap:10px;margin-top:10px;flex-wrap:wrap;}
   .seek-btn{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:500;padding:6px 14px;border-radius:6px;cursor:pointer;transition:border-color .15s,color .15s;}
   .seek-btn:hover{border-color:var(--red);color:var(--red);}
@@ -3362,12 +3767,56 @@ WATCH_HTML = """<!DOCTYPE html>
   .sync-btn{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:500;padding:6px 14px;border-radius:6px;cursor:pointer;}
   .sync-btn:hover{border-color:var(--red);color:var(--red);}
   .sync-val{font-family:monospace;font-size:.95rem;color:var(--red);min-width:60px;text-align:center;}
+
+  /* Loading / error overlay: full screen, high contrast, large touch targets */
+  .ov{position:fixed;inset:0;z-index:50;background:#000;color:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;transition:opacity .35s ease;}
+  .ov.hide{opacity:0;pointer-events:none;}
+  .ov-bg{position:absolute;inset:-40px;background:#000 center/cover no-repeat;filter:blur(28px) brightness(.35);transform:scale(1.1);}
+  .ov-inner{position:relative;width:100%;max-width:900px;padding:32px;display:flex;flex-direction:column;align-items:center;text-align:center;}
+  .ov-art{position:relative;width:min(560px,80vw);aspect-ratio:16/9;border-radius:18px;overflow:hidden;background:#15151b center/cover no-repeat;box-shadow:0 18px 60px rgba(0,0,0,.6);}
+  .ov-art::after{content:"";position:absolute;inset:0;background:rgba(0,0,0,.45);}
+  .ov-spin{position:absolute;z-index:1;left:50%;top:50%;width:112px;height:112px;margin:-56px 0 0 -56px;border-radius:50%;border:10px solid rgba(255,255,255,.22);border-top-color:#fff;animation:ovspin .9s linear infinite;}
+  @keyframes ovspin{to{transform:rotate(360deg);}}
+  .ov-icon{position:absolute;z-index:1;left:50%;top:50%;width:112px;height:112px;margin:-56px 0 0 -56px;border-radius:50%;border:8px solid var(--red);color:#fff;background:rgba(227,25,55,.25);font-size:64px;font-weight:800;line-height:96px;display:none;}
+  .ov-title{margin-top:28px;font-size:2rem;font-weight:700;line-height:1.2;max-width:100%;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:1.2em;}
+  .ov-stage{margin-top:16px;font-size:1.6rem;font-weight:500;color:#e6e6ee;min-height:1.3em;}
+  .ov-steps{margin-top:18px;display:flex;gap:14px;}
+  .ov-steps i{display:block;width:56px;height:8px;border-radius:4px;background:rgba(255,255,255,.2);transition:background .3s;}
+  .ov-steps i.on{background:#fff;}
+  .ov-sub{margin-top:14px;font-size:1.1rem;color:#9a9aa8;min-height:1.3em;}
+  .ov-row{margin-top:30px;display:flex;gap:20px;justify-content:center;flex-wrap:wrap;}
+  .ov-btn{min-width:220px;min-height:80px;padding:0 36px;border-radius:40px;font-size:1.6rem;font-weight:700;border:none;cursor:pointer;font-family:inherit;}
+  .ov-btn:disabled{opacity:.5;}
+  .ov-primary{background:#fff;color:#000;display:none;}
+  .ov-secondary{background:rgba(255,255,255,.14);color:#fff;}
+  .ov.err .ov-spin,.ov.err .ov-steps{display:none;}
+  .ov.err .ov-icon,.ov.err .ov-primary{display:block;}
+  .ov-detail{margin-top:18px;font-size:.9rem;color:#77778a;max-width:100%;word-break:break-word;display:none;}
+  @media (max-height:620px){.ov-art{width:min(420px,60vw);}.ov-title{font-size:1.6rem;margin-top:18px;}.ov-row{margin-top:18px;}}
 </style>
 </head>
 <body>
+  <div id="ov" class="ov" role="status" aria-live="polite">
+    <div id="ov-bg" class="ov-bg" style="background-image:url('{{initial_thumb}}')"></div>
+    <div class="ov-inner">
+      <div id="ov-art" class="ov-art" style="background-image:url('{{initial_thumb}}')">
+        <div class="ov-spin"></div>
+        <div class="ov-icon">!</div>
+      </div>
+      <div id="ov-title" class="ov-title">{{initial_title}}</div>
+      <div id="ov-stage" class="ov-stage">Fetching video...</div>
+      <div class="ov-steps"><i id="ov-s1" class="on"></i><i id="ov-s2"></i><i id="ov-s3"></i></div>
+      <div id="ov-sub" class="ov-sub"></div>
+      <div class="ov-row">
+        <button id="ov-retry" class="ov-btn ov-primary">Retry</button>
+        <button id="ov-back" class="ov-btn ov-secondary">Cancel</button>
+      </div>
+      <div id="ov-detail" class="ov-detail"></div>
+    </div>
+  </div>
   <div class="top">
     <div class="title">MJPEG + AUDIO</div>
-    <a class="back" href="/">← Back</a>
+    <a class="back" id="back-link" href="/">← Back</a>
   </div>
   <div class="wrap">
     <img id="mjpeg" alt="Live MJPEG stream">
@@ -3397,15 +3846,15 @@ WATCH_HTML = """<!DOCTYPE html>
       <a id="resume-yes">Resume</a>
       <button class="dismiss" id="resume-no">dismiss</button>
     </div>
-    <div id="diag" class="diag"></div>
   </div>
 <script>
 (function () {
-  var sid = "{{stream_id}}";
-  var syncMs = "{{sync_ms}}";
-  var videoUrl = "{{video_url}}";
-  var videoQuality = "{{video_quality}}";
-  var localFile = "{{local_file}}";
+  var CFG = {{config_json}};
+  var sid = CFG.sid;
+  var syncMs = CFG.syncMs;
+  var videoUrl = CFG.videoUrl;
+  var videoQuality = CFG.videoQuality;
+  var localFile = CFG.localFile;
   if (!sid) {
     window.location.href = "/";
     return;
@@ -3413,7 +3862,6 @@ WATCH_HTML = """<!DOCTYPE html>
   var q = "?sid=" + encodeURIComponent(sid) + "&sync=" + encodeURIComponent(syncMs);
   var img = document.getElementById("mjpeg");
   var audio = document.getElementById("audio");
-  var diag = document.getElementById("diag");
   var seekPending  = document.getElementById("seek-pending");
   var seekCancel   = document.getElementById("seek-cancel");
   var elapsedEl    = document.getElementById("elapsed");
@@ -3422,6 +3870,222 @@ WATCH_HTML = """<!DOCTYPE html>
   var resumeText   = document.getElementById("resume-text");
   var resumeYes    = document.getElementById("resume-yes");
   var resumeNo     = document.getElementById("resume-no");
+  var titleEl      = document.getElementById("stream-title");
+  var params = new URLSearchParams(window.location.search);
+
+  // ── Loading overlay state ───────────────────────────────────────────────
+  // state: loading -> playing, or loading -> error. Auto-retry once.
+  var ov       = document.getElementById("ov");
+  var ovBg     = document.getElementById("ov-bg");
+  var ovArt    = document.getElementById("ov-art");
+  var ovTitle  = document.getElementById("ov-title");
+  var ovStage  = document.getElementById("ov-stage");
+  var ovSub    = document.getElementById("ov-sub");
+  var ovRetry  = document.getElementById("ov-retry");
+  var ovBack   = document.getElementById("ov-back");
+  var ovDetail = document.getElementById("ov-detail");
+  var ovSteps  = [document.getElementById("ov-s1"), document.getElementById("ov-s2"), document.getElementById("ov-s3")];
+  var state = "loading";
+  var attempt = parseInt(params.get("attempt") || "1", 10) || 1;
+  var loadStartMs = Date.now();
+  var CLIENT_TIMEOUT_MS = 75000;   // server gives up at 60s; this is a backstop
+  var STAGES = {
+    queued:    [1, "Fetching video..."],
+    resolving: [1, "Fetching video..."],
+    starting:  [2, "Starting stream..."],
+    live:      [3, "Buffering..."]
+  };
+
+  // Title/thumbnail hint left by the home page when a card was tapped, so
+  // the overlay shows artwork instantly (already in the browser cache).
+  var hint = null;
+  try {
+    hint = JSON.parse(sessionStorage.getItem("ocs_pending") || "null");
+    if (hint && (Date.now() - (hint.t || 0) > 120000)) hint = null;
+  } catch (e) { hint = null; }
+
+  function setArt(url) {
+    if (!url) return;
+    var css = "url('" + String(url).replace(/'/g, "%27") + "')";
+    ovArt.style.backgroundImage = css;
+    ovBg.style.backgroundImage = css;
+  }
+  function setTitle(t) {
+    if (!t) return;
+    if (ovTitle.textContent !== t) ovTitle.textContent = t;
+    if (titleEl.textContent !== t) titleEl.textContent = t;
+  }
+  if (hint && hint.thumb) setArt(hint.thumb); else setArt(CFG.thumb);
+  setTitle(CFG.title || (hint && hint.title) || "");
+
+  function setStage(stage) {
+    var s = STAGES[stage];
+    if (!s || state !== "loading") return;
+    ovStage.textContent = s[1];
+    for (var i = 0; i < ovSteps.length; i++) {
+      ovSteps[i].className = i < s[0] ? "on" : "";
+    }
+  }
+
+  var subTimer = setInterval(function () {
+    if (state !== "loading") return;
+    var secs = Math.floor((Date.now() - loadStartMs) / 1000);
+    var txt = secs >= 3 ? secs + "s" : "";
+    if (attempt > 1) txt = "Second try" + (txt ? " · " + txt : "");
+    ovSub.textContent = txt;
+    if (Date.now() - loadStartMs > CLIENT_TIMEOUT_MS) fail("timeout", "");
+  }, 1000);
+
+  function onFirstFrame() {
+    if (state !== "loading" || !img.naturalWidth) return;
+    state = "playing";
+    clearInterval(subTimer);
+    ov.className = "ov hide";
+    pageStartMs = Date.now();   // elapsed counter starts with the picture
+    try { sessionStorage.removeItem("ocs_pending"); } catch (e) {}
+  }
+  img.addEventListener("load", onFirstFrame);
+  // multipart MJPEG does not always fire load; poll naturalWidth as well
+  var frameTimer = setInterval(function () {
+    if (state !== "loading") { clearInterval(frameTimer); return; }
+    onFirstFrame();
+  }, 200);
+
+  function stopServerStream(done) {
+    var finished = false;
+    function finish() { if (!finished) { finished = true; if (done) done(); } }
+    try {
+      var x = new XMLHttpRequest();
+      x.open("GET", "/stop_stream?sid=" + encodeURIComponent(sid), true);
+      x.timeout = 2000;
+      x.onloadend = finish;
+      x.send();
+    } catch (e) {}
+    setTimeout(finish, 2500);
+  }
+
+  function urlWithAttempt(n, seekS) {
+    var p = new URLSearchParams(window.location.search);
+    p.set("attempt", String(n));
+    if (typeof seekS === "number" && seekS > 0) p.set("seek", String(seekS));
+    return window.location.pathname + "?" + p.toString();
+  }
+
+  function friendly(reason, data) {
+    var err = ((data && data.error) || "") + " " + ((data && data.error_detail) || "");
+    err = err.toLowerCase();
+    if (reason === "timeout") {
+      return ["Taking too long", "The video didn't start in time. The connection may be slow."];
+    }
+    if (reason === "gone") {
+      return ["Stream ended", "This stream is no longer running on the server."];
+    }
+    if (reason === "dropped") {
+      return ["Playback stopped", "The video stream was interrupted."];
+    }
+    if (err.indexOf("private") >= 0 || err.indexOf("unavailable") >= 0 || err.indexOf("sign in") >= 0 || err.indexOf("members") >= 0) {
+      return ["Video unavailable", "This video can't be played. It may be private, age-restricted or removed."];
+    }
+    return ["Couldn't play this video", "Something went wrong while starting the stream."];
+  }
+
+  function showError(reason, data) {
+    state = "error";
+    clearInterval(subTimer);
+    try { audio.pause(); } catch (e) {}
+    var msg = friendly(reason, data);
+    ov.className = "ov err";
+    ovStage.textContent = msg[0];
+    ovSub.textContent = msg[1];
+    ovBack.textContent = "Back";
+    ovRetry.disabled = false;
+    var detail = (data && (data.error || "")) || "";
+    if (detail) {
+      ovDetail.textContent = detail;
+      ovDetail.style.display = "block";
+    }
+  }
+
+  // reason: "error" | "timeout" | "gone" | "dropped"
+  function fail(reason, data) {
+    if (state === "error" || state === "retrying") return;
+    var wasPlaying = state === "playing";
+    if (wasPlaying) {
+      var posS = currentElapsedS();
+      if (posS > 10) saveProgress(posS);
+      showError("dropped", data);
+      return;
+    }
+    if (attempt < 2 && !(data && data.retryable === false)) {
+      // Automatic second attempt with a fresh pipeline.
+      state = "retrying";
+      clearInterval(subTimer);
+      try { audio.pause(); } catch (e) {}
+      ovStage.textContent = "Retrying...";
+      ovSub.textContent = "";
+      stopServerStream(function () { window.location.replace(urlWithAttempt(2)); });
+      return;
+    }
+    showError(reason, data);
+  }
+
+  ovRetry.addEventListener("click", function () {
+    if (ovRetry.disabled) return;
+    ovRetry.disabled = true;
+    ovStage.textContent = "Retrying...";
+    var seek = state === "error" && pageStartMs ? currentElapsedS() : 0;
+    stopServerStream(function () { window.location.replace(urlWithAttempt(2, seek)); });
+  });
+  function goBack() {
+    ovBack.disabled = true;
+    stopServerStream(function () { window.location.href = "/"; });
+  }
+  ovBack.addEventListener("click", goBack);
+  document.getElementById("back-link").addEventListener("click", function (e) {
+    e.preventDefault();
+    goBack();
+  });
+
+  function getStatus(cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/stream_status?sid=" + encodeURIComponent(sid), true);
+    xhr.timeout = 5000;
+    xhr.onloadend = function () {
+      if (xhr.status === 404) { cb("gone", null); return; }
+      if (xhr.status < 200 || xhr.status >= 300) { cb("neterr", null); return; }
+      try { cb("ok", JSON.parse(xhr.responseText)); } catch (e) { cb("neterr", null); }
+    };
+    xhr.send();
+  }
+
+  (function pollStage() {
+    if (state !== "loading") return;
+    getStatus(function (kind, d) {
+      if (state !== "loading") return;
+      if (kind === "gone") { fail("gone", null); return; }
+      if (d) {
+        if (d.title) setTitle(d.title);
+        if (d.thumb && !(hint && hint.thumb)) setArt(d.thumb);
+        if (d.status === "error") { fail("error", d); return; }
+        // Stopped from elsewhere (another tab switched videos): no auto-retry,
+        // otherwise two tabs would keep stealing the stream from each other.
+        if (d.status === "done") { showError("gone", d); return; }
+        setStage(d.stage);
+      }
+      setTimeout(pollStage, 1000);
+    });
+  })();
+
+  // Keep polling for the title after playback starts (older behaviour).
+  (function pollTitle() {
+    if (titleEl.textContent || state === "error") return;
+    setTimeout(function () {
+      getStatus(function (kind, d) {
+        if (d && d.title) setTitle(d.title);
+        else pollTitle();
+      });
+    }, 3000);
+  })();
 
   // Start audio first so its pipeline is already running and buffered.
   audio.src = "/audio?sid=" + encodeURIComponent(sid);
@@ -3436,6 +4100,7 @@ WATCH_HTML = """<!DOCTYPE html>
   // Some browsers (including embedded WebViews) may block autoplay without
   // interaction. Retry on first user gesture.
   var retryPlay = function () {
+    if (state === "error" || state === "retrying") return;
     try {
       var p2 = audio.play();
       if (p2 && typeof p2.catch === "function") p2.catch(function () {});
@@ -3513,41 +4178,27 @@ WATCH_HTML = """<!DOCTYPE html>
   // sync_ms without skipping content from the beginning.
   img.src = "/stream" + q;
 
-  function showDiag(message) {
-    diag.style.display = "block";
-    diag.textContent = message;
-  }
-
   img.addEventListener("error", function () {
-    var xhr = new XMLHttpRequest();
-    xhr.open("GET", "/stream_status?sid=" + encodeURIComponent(sid), true);
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== 4) return;
-      if (xhr.status < 200 || xhr.status >= 300) {
-        showDiag("Video stream failed to load and diagnostics request failed.");
+    if (state === "error" || state === "retrying") return;
+    // Ask the server why, then show a friendly message (never raw JSON).
+    getStatus(function (kind, d) {
+      if (kind === "gone") { fail("gone", null); return; }
+      if (d && d.status === "error") { fail("error", d); return; }
+      if (state === "playing") {
+        if (d && d.status === "done") return;   // video simply ended
+        fail("dropped", d);
         return;
       }
-      try {
-        var data = JSON.parse(xhr.responseText);
-        var msg = [
-          "Video stream failed to load.",
-          "status: " + (data.status || "unknown"),
-          "error: " + (data.error || "n/a"),
-          "detail: " + (data.error_detail || "n/a")
-        ].join("\\n");
-        showDiag(msg);
-      } catch (err) {
-        showDiag("Video stream failed to load and diagnostics parse failed.");
-      }
-    };
-    xhr.send();
+      if (d && d.status === "done") { showError("gone", d); return; }
+      // 504 from the first-frame deadline, or a network hiccup
+      fail(d && d.stage !== "live" ? "timeout" : "error", d);
+    });
   });
 
   // ── Seek controls ────────────────────────────────────────────────────────
   // Read seek offset already applied (so accumulated offset stays correct
   // if the user seeks multiple times).
-  var params = new URLSearchParams(window.location.search);
-  var baseSeekS = parseInt("{{seek_s}}", 10) || parseInt(params.get("seek") || "0", 10) || 0;
+  var baseSeekS = parseInt(CFG.seekS, 10) || parseInt(params.get("seek") || "0", 10) || 0;
   var pendingOffsetS = 0;
   var seekTimer = null;
   var countdownInterval = null;
@@ -3576,7 +4227,7 @@ WATCH_HTML = """<!DOCTYPE html>
     seekTimer = setTimeout(function () {
       clearInterval(countdownInterval);
       var targetSeek = Math.max(0, baseSeekS + pendingOffsetS);
-      seekPending.textContent = "Reloading\u2026";
+      seekPending.textContent = "Reloading…";
       seekCancel.style.display = "none";
       var watchUrl;
       if (localFile) {
@@ -3612,29 +4263,13 @@ WATCH_HTML = """<!DOCTYPE html>
     elapsedEl.style.display = "none";
   }
 
-  // Fetch fps + title from server once the stream is live
-  var titleEl = document.getElementById("stream-title");
-  (function pollStatus() {
-    var xhr = new XMLHttpRequest();
-    xhr.open("GET", "/stream_status?sid=" + encodeURIComponent(sid), true);
-    xhr.timeout = 3000;
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== 4) return;
-      try {
-        var d = JSON.parse(xhr.responseText);
-        if (d.title && titleEl.textContent !== d.title) titleEl.textContent = d.title;
-        if (!d.title) setTimeout(pollStatus, 2000);
-      } catch(e) {
-        setTimeout(pollStatus, 2000);
-      }
-    };
-    xhr.send();
-  })();
-
   // ── Elapsed time display ────────────────────────────────────────────────
-  var pageStartMs = Date.now();
+  // Starts counting when the first frame is on screen, not at page load,
+  // so a slow start does not inflate the saved resume position.
+  var pageStartMs = 0;
 
   function currentElapsedS() {
+    if (!pageStartMs) return baseSeekS;
     return baseSeekS + Math.floor((Date.now() - pageStartMs) / 1000);
   }
 
@@ -3681,9 +4316,9 @@ WATCH_HTML = """<!DOCTYPE html>
     xhr.send();
   }
 
-  // Save every 30 seconds
+  // Save every 30 seconds (only once the picture is actually playing)
   if (progressKey) {
-    setInterval(function () { saveProgress(currentElapsedS()); }, 30000);
+    setInterval(function () { if (state === "playing") saveProgress(currentElapsedS()); }, 30000);
   }
 
   // Check for saved position on load — offer resume if > 60s into the video
@@ -3713,23 +4348,6 @@ WATCH_HTML = """<!DOCTYPE html>
 
   resumeNo.addEventListener("click", function () {
     resumeBanner.style.display = "none";
-  });
-
-  // On stream error, add position hint to the diagnostics message
-  var origError = img.onerror;
-  img.addEventListener("error", function () {
-    var posS = currentElapsedS();
-    if (posS > 10) {
-      saveProgress(posS);
-      // Append resume link below the existing diag after a short delay
-      // (let the existing error handler run first)
-      setTimeout(function () {
-        if (diag.style.display !== "none" && progressKey) {
-          diag.textContent += "\\n\\nLast saved position: " + fmtElapsed(posS) +
-            "\\nReload from here: " + window.location.origin + buildResumeUrl(posS);
-        }
-      }, 500);
-    }
   });
 })();
 </script>
@@ -4011,15 +4629,89 @@ def render_status_page() -> str:
             .replace("{{pluto_langs_json}}", json.dumps(PLUTO_LANGS))
             .replace("{{local_media_dir}}", LOCAL_MEDIA_DIR))
 
+def _js_json(value) -> str:
+    """JSON for safe embedding inside an inline <script> block."""
+    return (json.dumps(value)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
+
+
+def _html_escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 def render_watch_page(stream_id: str, sync_ms: int, video_url: str = "", quality: int | None = None,
-                      local_file: str = "", seek_s: int = 0) -> str:
+                      local_file: str = "", seek_s: int = 0, title: str = "", thumb: str = "") -> str:
+    config = {
+        "sid": stream_id,
+        "syncMs": str(sync_ms),
+        "videoUrl": video_url,
+        "videoQuality": str(quality or ""),
+        "localFile": local_file,
+        "seekS": int(seek_s),
+        "title": title or "",
+        "thumb": thumb or "",
+    }
     return (WATCH_HTML
-            .replace("{{stream_id}}", stream_id)
-            .replace("{{sync_ms}}", str(sync_ms))
-            .replace("{{video_url}}", video_url)
-            .replace("{{video_quality}}", str(quality or ""))
-            .replace("{{local_file}}", local_file)
-            .replace("{{seek_s}}", str(seek_s)))
+            .replace("{{config_json}}", _js_json(config))
+            .replace("{{initial_title}}", _html_escape(title or ""))
+            .replace("{{initial_thumb}}", _html_escape(thumb or "")))
+
+
+ERROR_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenCarStream</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:#000;color:#fff;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px;text-align:center;}
+  .box{max-width:720px;}
+  .icon{width:96px;height:96px;border-radius:50%;border:6px solid #e31937;color:#e31937;font-size:56px;font-weight:800;line-height:84px;margin:0 auto 28px;}
+  h1{font-size:2.4rem;font-weight:700;margin-bottom:14px;}
+  p{font-size:1.4rem;color:#b8b8c4;line-height:1.4;margin-bottom:36px;}
+  .row{display:flex;gap:20px;justify-content:center;flex-wrap:wrap;}
+  .btn{min-width:220px;min-height:80px;padding:0 36px;border-radius:40px;font-size:1.6rem;font-weight:700;border:none;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;}
+  .primary{background:#fff;color:#000;}
+  .secondary{background:#2a2a32;color:#fff;}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="icon">!</div>
+    <h1>{{headline}}</h1>
+    <p>{{message}}</p>
+    <div class="row">
+      <button class="btn primary" onclick="location.reload()">Retry</button>
+      <a class="btn secondary" href="/">Back</a>
+    </div>
+  </div>
+</body></html>"""
+
+
+def _friendly_error(code: int, msg: str) -> tuple[str, str]:
+    low = (msg or "").lower()
+    if code == 404:
+        return "Not found", "That page or stream no longer exists."
+    if "pluto" in low:
+        return "Channel unavailable", "Pluto TV did not return a stream for this channel. Try again in a moment."
+    if code in (400, 422):
+        return "Can't open this", "The link looks incomplete or invalid."
+    if code == 504 or "timed out" in low:
+        return "Taking too long", "The video didn't start in time. Check the connection and try again."
+    return "Something went wrong", "The video couldn't be started. Try again, or pick something else."
+
+
+def render_error_page(code: int, msg: str) -> str:
+    headline, message = _friendly_error(code, msg)
+    return (ERROR_HTML
+            .replace("{{headline}}", _html_escape(headline))
+            .replace("{{message}}", _html_escape(message)))
 
 def render_audio_page(stream_id: str, sync_ms: int, video_url: str = "", seek_s: int = 0, duration_s: int = 0) -> str:
     return (AUDIO_WATCH_HTML
@@ -4224,19 +4916,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(400, err)
                 return
             file_url = "file://" + quote(local_file, safe="/")
+            local_mode = (qs.get("mode", ["mjpeg"])[0] or "mjpeg").lower()
+            if local_mode not in ("mjpeg", "mp4", "audio"):
+                local_mode = "mjpeg"
             registry.cleanup_done()
-            stream = registry.get_or_create(
+            stream, _ = registry.acquire(
+                f"{local_mode}|{file_url}|seek={seek_s}",
                 file_url,
                 quality=None,
-                reuse_existing=False,
+                owner=self._client_id(),
+                reuse=(local_mode == "mjpeg"),
             )
             if not stream.title:
                 stream.title = os.path.splitext(os.path.basename(local_file))[0]
             if seek_s > 0:
                 stream.seek_s = float(seek_s)
-            local_mode = (qs.get("mode", ["mjpeg"])[0] or "mjpeg").lower()
-            if local_mode not in ("mjpeg", "mp4", "audio"):
-                local_mode = "mjpeg"
 
             if local_mode == "mp4":
                 vcodec, acodec = _probe_local_codecs(local_file)
@@ -4262,8 +4956,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # Warm local playback so configured sync delay reflects timeline
             # delay rather than ffmpeg startup overhead.
-            if stream.status == "starting" and stream._ff_proc is None:
-                threading.Thread(target=run_pipeline, args=(stream,), daemon=True).start()
+            stream.ensure_pipeline()
             warm_deadline = time.time() + 8.0
             while (
                 stream.frame is None
@@ -4271,7 +4964,8 @@ class Handler(BaseHTTPRequestHandler):
                 and time.time() < warm_deadline
             ):
                 time.sleep(0.05)
-            self._html(render_watch_page(stream.id, sync_ms, local_file=raw_file or "", seek_s=seek_s))
+            self._html(render_watch_page(stream.id, sync_ms, local_file=raw_file or "", seek_s=seek_s,
+                                         title=stream.title))
 
         elif path == "/pluto_channels":
             lang = qs.get("lang", [PLUTO_LANGS[0]])[0]
@@ -4293,28 +4987,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(400, f"Unsupported Pluto lang '{lang}'")
                 return
 
-            # Refresh Pluto session tokens per playback launch to avoid stale
-            # signed URLs being rejected with fallback "unsupported device" streams.
-            pluto_url, err = pluto_cache.build_channel_url(
-                lang, channel_id, force_refresh=True
-            )
-            if not pluto_url:
-                self._error(502, f"Pluto TV stream unavailable: {err}")
-                return
+            pluto_mode = (qs.get("mode", ["mjpeg"])[0] or "mjpeg").lower()
+            if pluto_mode not in ("mjpeg", "mp4", "audio"):
+                pluto_mode = "mjpeg"
+            pluto_key = f"{pluto_mode}|pluto:{lang}:{channel_id}"
+            owner = self._client_id()
             registry.cleanup_done()
-            stream = registry.get_or_create(
-                pluto_url,
-                quality=None,
-                reuse_existing=False,
+            stream = (
+                registry.find_reusable(pluto_key, owner)
+                if pluto_mode == "mjpeg" else None
             )
+            if stream is None:
+                # Refresh Pluto session tokens per playback launch to avoid stale
+                # signed URLs being rejected with fallback "unsupported device" streams.
+                pluto_url, err = pluto_cache.build_channel_url(
+                    lang, channel_id, force_refresh=True
+                )
+                if not pluto_url:
+                    self._error(502, f"Pluto TV stream unavailable: {err}")
+                    return
+                stream, _ = registry.acquire(
+                    pluto_key,
+                    pluto_url,
+                    quality=None,
+                    owner=owner,
+                    reuse=(pluto_mode == "mjpeg"),
+                )
+            pluto_url = stream.url
             if not stream.title:
                 with pluto_cache._lock:
                     ch = next((c for c in pluto_cache._by_lang.get(lang, []) if c.get("id") == channel_id), None)
                 if ch:
                     stream.title = ch["name"]
-            pluto_mode = (qs.get("mode", ["mjpeg"])[0] or "mjpeg").lower()
-            if pluto_mode not in ("mjpeg", "mp4", "audio"):
-                pluto_mode = "mjpeg"
             if pluto_mode == "mp4":
                 direct_url, err = _resolve_mp4_url(pluto_url, None)
                 self._html(render_mp4_page(direct_url, error_msg=err, stream_title=stream.title))
@@ -4322,7 +5026,8 @@ class Handler(BaseHTTPRequestHandler):
                 stream.audio_only = True
                 self._html(render_audio_page(stream.id, sync_ms))
             else:
-                self._html(render_watch_page(stream.id, sync_ms))
+                stream.ensure_pipeline()
+                self._html(render_watch_page(stream.id, sync_ms, title=stream.title))
 
         elif path == "/stop_stream":
             sid = qs.get("sid", [None])[0]
@@ -4332,7 +5037,9 @@ class Handler(BaseHTTPRequestHandler):
             stream = registry.get(sid)
             if stream:
                 stream.stop()
-                stream.status = "done"
+                with stream.lock:
+                    if stream.status != "error":
+                        stream.status = "done"
             self._json({"ok": True})
 
         elif path == "/stream_status":
@@ -4378,18 +5085,32 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 seek_s = 0.0
             registry.cleanup_done()
-            stream = registry.get_or_create(
+            # Same client + same video still starting -> reuse (double tap,
+            # reload). Different video -> old yt-dlp/ffmpeg are killed first.
+            stream, reused = registry.acquire(
+                f"{mode}|{video_url}|q={quality or ''}|seek={int(seek_s)}",
                 video_url,
                 quality=quality,
-                reuse_existing=False,
+                owner=self._client_id(),
+                reuse=(mode == "mjpeg"),
             )
-            stream.seek_s = seek_s
+            if not reused:
+                stream.seek_s = seek_s
+            if not stream.thumb:
+                stream.thumb = _youtube_thumb(video_url)
+            if reused:
+                log.info(f"[{stream.id}] Reusing starting stream for repeated /watch")
             if mode == "audio":
                 stream.audio_only = True
                 duration_s = _fetch_duration_s(video_url)
                 self._html(render_audio_page(stream.id, sync_ms, video_url, int(seek_s), duration_s))
             else:
-                self._html(render_watch_page(stream.id, sync_ms, video_url, quality))
+                # Start resolving right away instead of waiting for the page
+                # to load and request /stream (saves a round trip over LTE).
+                stream.ensure_pipeline()
+                self._html(render_watch_page(stream.id, sync_ms, video_url, quality,
+                                             seek_s=int(seek_s), title=stream.title,
+                                             thumb=stream.thumb))
 
         elif path == "/stream":
             raw_sync = qs.get("sync", [None])[0]
@@ -4980,9 +5701,7 @@ class Handler(BaseHTTPRequestHandler):
         delay_s = max(0.0, sync_ms / 1000.0)
 
         # Start pipeline if not already running
-        if stream.status == "starting" and stream._ff_proc is None:
-            threading.Thread(target=run_pipeline,
-                             args=(stream,), daemon=True).start()
+        stream.ensure_pipeline()
 
         # Wait up to 60s for first frame (yt-dlp alone can take 15-20s on a Pi)
         deadline = time.time() + 60
@@ -5063,12 +5782,7 @@ class Handler(BaseHTTPRequestHandler):
         Always resolves a direct CDN URL first so ffmpeg reads at real-time
         pace and never buffers a whole long video into a pipe."""
         audio_fmt = "bestaudio[ext=m4a]/bestaudio"
-        url_r = subprocess.run(
-            ["yt-dlp", "--js-runtimes", "node", "--no-playlist",
-             "-f", audio_fmt, "--get-url", "--quiet", url],
-            capture_output=True, text=True, timeout=30,
-        )
-        direct_url = url_r.stdout.strip().splitlines()[0] if url_r.returncode == 0 else ""
+        direct_url = _ytdlp_audio_url(url, audio_fmt)
 
         if direct_url:
             seek_args = ["-ss", str(int(seek_s))] if seek_s > 0 else []
@@ -5108,9 +5822,7 @@ class Handler(BaseHTTPRequestHandler):
         # audio_only mode: pipeline uses _start_audio_buffer_any which always
         # fills _audio_chunks regardless of stream type. Start pipeline if needed.
         if stream.audio_only:
-            if stream.status == "starting" and stream._audio_proc is None:
-                threading.Thread(target=run_pipeline,
-                                 args=(stream,), daemon=True).start()
+            stream.ensure_pipeline()
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/mpeg")
@@ -5140,9 +5852,7 @@ class Handler(BaseHTTPRequestHandler):
         if _is_direct_stream(stream.url):
             # MJPEG mode: audio is captured into _audio_chunks by the muxed pipeline.
             # Start the pipeline here if /audio is requested before /stream.
-            if stream.status == "starting" and stream._ff_proc is None:
-                threading.Thread(target=run_pipeline,
-                                 args=(stream,), daemon=True).start()
+            stream.ensure_pipeline()
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "audio/mpeg")
@@ -5199,11 +5909,36 @@ class Handler(BaseHTTPRequestHandler):
                         pass
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+    def _client_id(self) -> str:
+        """Stable per-browser id (cookie) so one car's taps only replace that
+        car's streams. Issued on first use and sent back with the next HTML."""
+        cached = getattr(self, "_cid", None)
+        if cached:
+            return cached
+        cid = ""
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == CLIENT_COOKIE and re.fullmatch(r"[A-Za-z0-9]{8,64}", value or ""):
+                cid = value
+                break
+        if not cid:
+            cid = os.urandom(12).hex()
+            self._new_cid = cid
+        self._cid = cid
+        return cid
+
     def _html(self, body: str, code: int = 200):
         data = body.encode()
         self.send_response(code)
         self.send_header("Content-Type",   "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control",  "no-store")
+        new_cid = getattr(self, "_new_cid", None)
+        if new_cid:
+            self.send_header(
+                "Set-Cookie",
+                f"{CLIENT_COOKIE}={new_cid}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax",
+            )
         self.end_headers()
         self.wfile.write(data)
 
@@ -5216,6 +5951,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _error(self, code: int, msg: str):
+        # Page navigations get a readable page with Retry/Back buttons
+        # instead of raw JSON. API, <img> and XHR callers still get JSON.
+        if "text/html" in (self.headers.get("Accept") or ""):
+            self._html(render_error_page(code, msg), code)
+            return
         self._json({"error": msg, "code": code}, code)
 
 
